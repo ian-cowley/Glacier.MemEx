@@ -1,0 +1,14 @@
+bin/
+obj/
+packages/
+TestResults/
+BenchmarkDotNet.Artifacts/
+.vs/
+*.user
+*.suo
+*.log
+*.tmp
+appsettings*.json
+!appsettings.template.json
+*.env*
+!.env.example
