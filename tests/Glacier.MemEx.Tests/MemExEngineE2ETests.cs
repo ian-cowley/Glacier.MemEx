@@ -72,4 +72,43 @@ public class MemExEngineE2ETests
         Assert.Contains("Architecture > Storage > BufferPool", queryResult.FormattedContext);
         Assert.Contains("Clock-Pro", queryResult.FormattedContext);
     }
+
+    [Fact]
+    public void SleepConsolidationBridge_ExportsTopCandidates_AndPrunesTraces()
+    {
+        var engine = new MemExEngine();
+        long nowUs = 2_000_000_000L;
+
+        var hot = new EpisodicTrace
+        {
+            Id = "hot-1",
+            Content = "Vulkan Q3_K kernel fuses block dequantization with warp reduction.",
+            BaseImportance = 4.5f,
+            TimestampUs = nowUs - 5_000_000L
+        };
+        hot.RecordAccess(nowUs - 1_000_000L);
+
+        var cold = new EpisodicTrace
+        {
+            Id = "cold-1",
+            Content = "Unrelated stale note from a long time ago.",
+            BaseImportance = 0.2f,
+            TimestampUs = 1_000_000L // ~2000s ago
+        };
+
+        engine.StoreTrace(hot);
+        engine.StoreTrace(cold);
+
+        var candidates = engine.ExportConsolidationCandidates(maxCount: 10, minAccessCount: 1, currentTimestampUs: nowUs);
+        Assert.Single(candidates);
+        Assert.Equal("hot-1", candidates[0].Id);
+
+        int prunedSpecific = engine.PruneTraces(candidates.Select(c => c.Id));
+        Assert.Equal(1, prunedSpecific);
+        Assert.Equal(1, engine.Count);
+
+        int prunedDecayed = engine.PruneDecayedTraces(minRecencyScore: 0.5, currentTimestampUs: nowUs);
+        Assert.Equal(1, prunedDecayed);
+        Assert.Equal(0, engine.Count);
+    }
 }

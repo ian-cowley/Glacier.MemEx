@@ -137,4 +137,84 @@ public sealed class MemExEngine
             FormattedContext = formattedContext
         };
     }
+
+    /// <summary>
+    /// Exports top-scoring episodic traces for offline Sleep Consolidation (dreaming / GKD distillation),
+    /// prioritizing traces with high ACT-R recency, base importance, and repeated recall.
+    /// </summary>
+    public IReadOnlyList<EpisodicTrace> ExportConsolidationCandidates(
+        int maxCount = 64,
+        int minAccessCount = 0,
+        long? currentTimestampUs = null)
+    {
+        if (maxCount <= 0) throw new ArgumentOutOfRangeException(nameof(maxCount));
+        if (minAccessCount < 0) throw new ArgumentOutOfRangeException(nameof(minAccessCount));
+
+        long nowUs = currentTimestampUs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
+        var candidates = new List<(EpisodicTrace Trace, double Score)>();
+
+        foreach (var trace in _traces.Values)
+        {
+            if (string.IsNullOrWhiteSpace(trace.Content) || trace.AccessCount < minAccessCount)
+                continue;
+
+            double recency = PowerLawDecayCalculator.ComputeRecencyScore(
+                trace,
+                nowUs,
+                _options.DecayParameterD,
+                _options.TimeScaleTauSeconds);
+
+            double importance = Math.Clamp(trace.BaseImportance, 0.1f, 5.0f) / 5.0;
+            double score = (_options.WeightDecay * recency) + (_options.WeightImportance * importance);
+            candidates.Add((trace, score));
+        }
+
+        return candidates
+            .OrderByDescending(c => c.Score)
+            .Take(maxCount)
+            .Select(c => c.Trace)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Synaptic Pruning: removes consolidated trace IDs from volatile fast memory.
+    /// </summary>
+    public int PruneTraces(IEnumerable<string> traceIds)
+    {
+        ArgumentNullException.ThrowIfNull(traceIds);
+        int removed = 0;
+        foreach (string id in traceIds)
+        {
+            if (!string.IsNullOrEmpty(id) && _traces.TryRemove(id, out _))
+            {
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    /// <summary>
+    /// Synaptic Pruning: removes stale traces whose ACT-R recency score has decayed below <paramref name="minRecencyScore"/>.
+    /// </summary>
+    public int PruneDecayedTraces(double minRecencyScore = 0.05, long? currentTimestampUs = null)
+    {
+        long nowUs = currentTimestampUs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
+        int removed = 0;
+
+        foreach (var kvp in _traces)
+        {
+            double recency = PowerLawDecayCalculator.ComputeRecencyScore(
+                kvp.Value,
+                nowUs,
+                _options.DecayParameterD,
+                _options.TimeScaleTauSeconds);
+
+            if (recency < minRecencyScore && _traces.TryRemove(kvp.Key, out _))
+            {
+                removed++;
+            }
+        }
+
+        return removed;
+    }
 }
