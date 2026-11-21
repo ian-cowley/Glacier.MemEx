@@ -10,8 +10,21 @@ using Glacier.Quant.Kernels;
 
 public static class TwoTierVectorFilter
 {
+    internal static bool AreAllFinite(ReadOnlySpan<float> values)
+    {
+        for (int i = 0; i < values.Length; i++)
+        {
+            if (!float.IsFinite(values[i]))
+                return false;
+        }
+        return true;
+    }
+
     public static ulong[] QuantizeTo1Bit(ReadOnlySpan<float> embedding)
     {
+        if (!AreAllFinite(embedding))
+            throw new ArgumentException("Embedding contains non-finite (NaN or Infinity) values.", nameof(embedding));
+
         int blocks = (embedding.Length + BlockBinary1Bit.BlockSize - 1) / BlockBinary1Bit.BlockSize;
         int paddedLen = blocks * BlockBinary1Bit.BlockSize;
 
@@ -39,56 +52,124 @@ public static class TwoTierVectorFilter
         int coarseLimit = 64,
         int finalLimit = 16)
     {
-        if (traces.Count == 0 || queryEmbedding.Length == 0) return [];
+        ArgumentNullException.ThrowIfNull(traces);
 
-        // 1. Tier 1: Coarse 1-bit binary Hamming distance filter
-        ulong[] queryBits = QuantizeTo1Bit(queryEmbedding);
+        if (!AreAllFinite(queryEmbedding))
+            throw new ArgumentException("Query embedding contains non-finite (NaN or Infinity) values.", nameof(queryEmbedding));
 
-        var coarseCandidates = new List<(EpisodicTrace Trace, int HammingDistance)>(traces.Count);
+        if (traces.Count == 0 || queryEmbedding.Length == 0 || coarseLimit <= 0 || finalLimit <= 0)
+            return [];
+
+        // Filter out null, mismatched-dimension, or non-finite candidate embeddings BEFORE Tier 1
+        // so invalid candidates never occupy coarseLimit slots with HammingDistance == 0.
+        var validTraces = new List<EpisodicTrace>(traces.Count);
         foreach (var trace in traces)
         {
-            if (trace.Embedding == null) continue;
-
-            trace.BinaryEmbedding ??= QuantizeTo1Bit(trace.Embedding);
-
-            int dist = 0;
-            int len = Math.Min(queryBits.Length, trace.BinaryEmbedding.Length);
-            for (int i = 0; i < len; i++)
+            if (trace?.Embedding == null ||
+                trace.Embedding.Length != queryEmbedding.Length ||
+                !AreAllFinite(trace.Embedding))
             {
-                dist += BitOperations.PopCount(queryBits[i] ^ trace.BinaryEmbedding[i]);
+                continue;
             }
-
-            coarseCandidates.Add((trace, dist));
+            validTraces.Add(trace);
         }
 
-        // Sort by Hamming distance ascending (smaller distance = higher similarity)
-        var topCandidates = coarseCandidates
-            .OrderBy(c => c.HammingDistance)
-            .Take(coarseLimit)
-            .Select(c => c.Trace)
-            .ToList();
+        if (validTraces.Count == 0)
+            return [];
+
+        IReadOnlyList<EpisodicTrace> topCandidates;
+        // For dimensions <= BlockBinary1Bit.BlockSize (64), 1-bit block zero-padding + mean-bias
+        // quantization distorts magnitudes and fits in a single ulong, whereas exact FP32 cosine
+        // is both faster and eliminates small-dimension starvation. Same when validTraces <= coarseLimit.
+        if (queryEmbedding.Length <= BlockBinary1Bit.BlockSize || validTraces.Count <= coarseLimit)
+        {
+            topCandidates = validTraces;
+        }
+        else
+        {
+            // 1. Tier 1: Coarse 1-bit binary Hamming distance filter
+            ulong[] queryBits = QuantizeTo1Bit(queryEmbedding);
+
+            var coarseCandidates = new List<(EpisodicTrace Trace, int HammingDistance)>(validTraces.Count);
+            foreach (var trace in validTraces)
+            {
+                if (trace.BinaryEmbedding == null || trace.BinaryEmbedding.Length != queryBits.Length)
+                {
+                    trace.BinaryEmbedding = QuantizeTo1Bit(trace.Embedding);
+                }
+
+                int dist = 0;
+                for (int i = 0; i < queryBits.Length; i++)
+                {
+                    dist += BitOperations.PopCount(queryBits[i] ^ trace.BinaryEmbedding[i]);
+                }
+
+                coarseCandidates.Add((trace, dist));
+            }
+
+            topCandidates = coarseCandidates
+                .OrderBy(c => c.HammingDistance)
+                .Take(coarseLimit)
+                .Select(c => c.Trace)
+                .ToList();
+        }
 
         // 2. Tier 2: Exact FP32 Cosine Similarity Re-Ranking
         var ranked = new List<(EpisodicTrace Trace, float CosineSimilarity)>(topCandidates.Count);
         float queryNorm = TensorPrimitives.Norm(queryEmbedding);
-        if (queryNorm <= 1e-12f) queryNorm = 1.0f;
 
         foreach (var cand in topCandidates)
         {
-            if (cand.Embedding == null || cand.Embedding.Length != queryEmbedding.Length)
-                continue;
-
-            float dot = TensorPrimitives.Dot(queryEmbedding, cand.Embedding);
-            float candNorm = TensorPrimitives.Norm(cand.Embedding);
-            if (candNorm <= 1e-12f) candNorm = 1.0f;
-
-            float cosine = dot / (queryNorm * candNorm);
-            ranked.Add((cand, Math.Clamp(cosine, -1.0f, 1.0f)));
+            float cosine = ComputeCosineSimilarity(queryEmbedding, cand.Embedding!, queryNorm);
+            ranked.Add((cand, cosine));
         }
 
         return ranked
             .OrderByDescending(r => r.CosineSimilarity)
             .Take(finalLimit)
             .ToList();
+    }
+
+    private static float ComputeCosineSimilarity(ReadOnlySpan<float> query, ReadOnlySpan<float> cand, float queryNorm)
+    {
+        float candNorm = TensorPrimitives.Norm(cand);
+        float dot = TensorPrimitives.Dot(query, cand);
+
+        if (float.IsFinite(queryNorm) && float.IsFinite(candNorm) && float.IsFinite(dot))
+        {
+            if (queryNorm <= 1e-12f || candNorm <= 1e-12f)
+                return 0.0f;
+
+            float denom = queryNorm * candNorm;
+            if (float.IsFinite(denom) && denom > 0.0f)
+            {
+                float cos = dot / denom;
+                if (float.IsFinite(cos))
+                    return Math.Clamp(cos, -1.0f, 1.0f);
+            }
+        }
+
+        // Overflow-safe double fallback for extreme finite magnitudes
+        double dDot = 0.0;
+        double dQNormSq = 0.0;
+        double dCNormSq = 0.0;
+        for (int i = 0; i < query.Length; i++)
+        {
+            double qv = query[i];
+            double cv = cand[i];
+            dDot += qv * cv;
+            dQNormSq += qv * qv;
+            dCNormSq += cv * cv;
+        }
+
+        double dDenom = Math.Sqrt(dQNormSq) * Math.Sqrt(dCNormSq);
+        if (!double.IsFinite(dDenom) || dDenom <= 1e-24)
+            return 0.0f;
+
+        double dCos = dDot / dDenom;
+        if (!double.IsFinite(dCos))
+            return 0.0f;
+
+        return Math.Clamp((float)dCos, -1.0f, 1.0f);
     }
 }

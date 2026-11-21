@@ -27,7 +27,7 @@ public sealed class MemExEngine
     {
         ArgumentNullException.ThrowIfNull(trace);
 
-        if (trace.Embedding != null && trace.BinaryEmbedding == null)
+        if (trace.Embedding != null && trace.BinaryEmbedding == null && TwoTierVectorFilter.AreAllFinite(trace.Embedding))
         {
             trace.BinaryEmbedding = TwoTierVectorFilter.QuantizeTo1Bit(trace.Embedding);
         }
@@ -49,6 +49,11 @@ public sealed class MemExEngine
         long? currentTimestampUs = null,
         int? maxTokens = null)
     {
+        if (queryEmbedding.Length > 0 && !TwoTierVectorFilter.AreAllFinite(queryEmbedding))
+        {
+            throw new ArgumentException("Query embedding contains non-finite (NaN or Infinity) values.", nameof(queryEmbedding));
+        }
+
         long nowUs = currentTimestampUs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
         int budget = maxTokens ?? _options.MaxPromptTokens;
         var traceList = _traces.Values.ToList();
