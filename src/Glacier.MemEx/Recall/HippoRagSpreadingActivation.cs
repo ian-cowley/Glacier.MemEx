@@ -17,17 +17,18 @@ public static class HippoRagSpreadingActivation
         double dampingAlpha = 0.85,
         int maxIterations = 20)
     {
-        if (queryEntities.Count == 0 || allTraces.Count == 0) return [];
+        if (queryEntities == null || queryEntities.Count == 0 || allTraces == null || allTraces.Count == 0) return [];
 
         // 1. Build entity co-occurrence adjacency list
         var graph = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var trace in allTraces)
         {
-            var ents = trace.Entities;
-            if (ents.Count == 0) continue;
+            var ents = trace?.Entities;
+            if (ents == null || ents.Count == 0) continue;
 
             for (int i = 0; i < ents.Count; i++)
             {
+                if (string.IsNullOrWhiteSpace(ents[i])) continue;
                 if (!graph.TryGetValue(ents[i], out var neighbors))
                 {
                     neighbors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -36,7 +37,7 @@ public static class HippoRagSpreadingActivation
 
                 for (int j = 0; j < ents.Count; j++)
                 {
-                    if (i != j) neighbors.Add(ents[j]);
+                    if (i != j && !string.IsNullOrWhiteSpace(ents[j])) neighbors.Add(ents[j]);
                 }
             }
         }
@@ -48,7 +49,7 @@ public static class HippoRagSpreadingActivation
 
         // 2. Initialize teleport distribution vector p0
         var p0 = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        var activeSeeds = queryEntities.Where(graph.ContainsKey).ToList();
+        var activeSeeds = queryEntities.Where(e => !string.IsNullOrWhiteSpace(e) && graph.ContainsKey(e)).ToList();
 
         if (activeSeeds.Count == 0)
         {
@@ -101,12 +102,12 @@ public static class HippoRagSpreadingActivation
     /// </summary>
     public static double ScoreTrace(EpisodicTrace trace, IReadOnlyDictionary<string, double> pprScores)
     {
-        if (trace.Entities.Count == 0 || pprScores.Count == 0) return 0.0;
+        if (trace?.Entities == null || trace.Entities.Count == 0 || pprScores == null || pprScores.Count == 0) return 0.0;
 
         double sum = 0.0;
         foreach (var entity in trace.Entities)
         {
-            if (pprScores.TryGetValue(entity, out double s))
+            if (!string.IsNullOrWhiteSpace(entity) && pprScores.TryGetValue(entity, out double s))
             {
                 sum += s;
             }

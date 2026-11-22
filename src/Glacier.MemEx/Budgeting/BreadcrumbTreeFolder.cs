@@ -20,18 +20,18 @@ public static class BreadcrumbTreeFolder
             sb.AppendLine();
 
             // Structural breadcrumbs header
-            string breadcrumbStr = trace.Breadcrumbs.Count > 0
+            string breadcrumbStr = trace.Breadcrumbs is { Count: > 0 }
                 ? string.Join(" > ", trace.Breadcrumbs)
                 : "Episodic Trace";
 
             sb.AppendLine($"### [{i + 1}] {breadcrumbStr}");
 
-            if (trace.Entities.Count > 0)
+            if (trace.Entities is { Count: > 0 })
             {
                 sb.AppendLine($"*Entities*: {string.Join(", ", trace.Entities)}");
             }
 
-            string content = trace.Content.Trim();
+            string content = (trace.Content ?? string.Empty).Trim();
             if (foldDeepSubtrees && content.Length > 240)
             {
                 // Fold deep content to summary

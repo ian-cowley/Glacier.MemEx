@@ -2,11 +2,17 @@ namespace Glacier.MemEx.Models;
 
 using System;
 using System.Collections.Generic;
+using System.Net.Http;
+using System.Threading;
+using Glacier.Rag.Embeddings;
 
 public sealed class EpisodicTrace
 {
     private readonly object _syncRoot = new();
     private readonly List<long> _accessTimestampsUs = [];
+    private float[]? _embedding;
+    private ulong[]? _binaryEmbedding;
+    private int _tokenCount;
 
     public string Id { get; init; } = Guid.NewGuid().ToString("N");
     public string Content { get; init; } = "";
@@ -33,12 +39,28 @@ public sealed class EpisodicTrace
     }
     public object SyncRoot => _syncRoot;
     public List<string> Breadcrumbs { get; init; } = [];
-    public float[]? Embedding { get; init; }
-    public ulong[]? BinaryEmbedding { get; set; }
+    public float[]? Embedding
+    {
+        get => Volatile.Read(ref _embedding);
+        init => Volatile.Write(ref _embedding, value);
+    }
+    public ulong[]? BinaryEmbedding
+    {
+        get => Volatile.Read(ref _binaryEmbedding);
+        set => Volatile.Write(ref _binaryEmbedding, value);
+    }
     public List<string> Entities { get; init; } = [];
-    public int TokenCount { get; init; }
+    public int TokenCount
+    {
+        get => Volatile.Read(ref _tokenCount);
+        init => Volatile.Write(ref _tokenCount, value);
+    }
     public float BaseImportance { get; init; } = 1.0f;
     public Dictionary<string, string> Metadata { get; init; } = [];
+
+    internal void SetTokenCount(int value) => Volatile.Write(ref _tokenCount, value);
+
+    internal void SetEmbedding(float[]? value) => Volatile.Write(ref _embedding, value);
 
     public void RecordAccess(long timestampUs)
     {
@@ -93,6 +115,19 @@ public sealed class MemExOptions
     public float WeightImportance { get; init; } = 0.10f;
     public int CoarseCandidateLimit { get; init; } = 64;
     public int MaxPromptTokens { get; init; } = 2048;
+
+    public bool EnableNpuEmbeddings { get; init; } = true;
+    public bool AutoEmbedMissingVectors { get; init; } = true;
+    public string? EmbeddingEndpoint { get; init; }
+    public string? EmbeddingModelId { get; init; }
+    public string? EmbeddingApiKey { get; init; }
+    public int EmbeddingDimensions { get; init; }
+    public int FallbackHashDimensions { get; init; } = 384;
+    public HttpClient? HttpClient { get; init; }
+    public IEmbeddingModel? EmbeddingModel { get; init; }
+    public TimeSpan? ProbeTimeout { get; init; }
+    public TimeSpan? ProbeCacheTtl { get; init; }
+    public TimeSpan? EmbeddingTimeout { get; init; }
 }
 
 public sealed class MemoryQueryResult
