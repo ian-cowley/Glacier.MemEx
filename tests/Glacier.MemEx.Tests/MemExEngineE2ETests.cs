@@ -111,4 +111,47 @@ public class MemExEngineE2ETests
         Assert.Equal(1, prunedDecayed);
         Assert.Equal(0, engine.Count);
     }
+
+    [Fact]
+    public void MemExEngine_UnembeddedTrace_DoesNotReceivePhantomZeroVectorBoost()
+    {
+        using var engine = new MemExEngine(new MemExOptions
+        {
+            AutoEmbedMissingVectors = false,
+            WeightDecay = 0f,
+            WeightVector = 10.0f,
+            WeightGraph = 0f,
+            WeightImportance = 0f,
+            MaxPromptTokens = 50
+        });
+
+        float[] q = [1f, 0f, 0f, 0f];
+        float[] anti = [-1f, 0f, 0f, 0f]; // cosine = -1 -> normVec = 0.0
+
+        engine.StoreTrace(new EpisodicTrace { Id = "unembedded", Content = "No vector here", TokenCount = 40, BaseImportance = 1f });
+        engine.StoreTrace(new EpisodicTrace { Id = "embedded", Content = "Has vector", Embedding = [0.2f, 1f, 0f, 0f], TokenCount = 40, BaseImportance = 1f });
+
+        // Query against anti-aligned vector would score anti at 0.0 and previously scored unembedded at 0.5!
+        engine.StoreTrace(new EpisodicTrace { Id = "slightly-neg", Content = "Slightly negative", Embedding = [-0.2f, 1f, 0f, 0f], TokenCount = 40, BaseImportance = 1f });
+        var res = engine.Query("test", q, maxTokens: 45);
+        Assert.Single(res.SelectedTraces);
+        Assert.Equal("embedded", res.SelectedTraces[0].Id);
+
+        // Specifically verify unembedded does NOT beat a positive-cosine trace and ties with cosine=-1 (0.0 normVec):
+        using var engine2 = new MemExEngine(new MemExOptions
+        {
+            AutoEmbedMissingVectors = false,
+            WeightDecay = 0f,
+            WeightVector = 10.0f,
+            WeightGraph = 0f,
+            WeightImportance = 0f,
+            MaxPromptTokens = 50
+        });
+        engine2.StoreTrace(new EpisodicTrace { Id = "unembedded", Content = "No vector", TokenCount = 40, BaseImportance = 1f });
+        engine2.StoreTrace(new EpisodicTrace { Id = "weak-pos", Content = "Weak match", Embedding = [-0.5f, 1f, 0f, 0f], TokenCount = 40, BaseImportance = 1f });
+        // cosine([-0.5,1,0,0], [1,0,0,0]) = -0.447 -> normVec = 0.276 > 0.0 (unembedded)
+        var res2 = engine2.Query("test", q, maxTokens: 45);
+        Assert.Single(res2.SelectedTraces);
+        Assert.Equal("weak-pos", res2.SelectedTraces[0].Id);
+    }
 }

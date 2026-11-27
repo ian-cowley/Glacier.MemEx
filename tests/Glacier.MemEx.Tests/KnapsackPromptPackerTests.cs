@@ -35,4 +35,18 @@ public class KnapsackPromptPackerTests
         // Huge Low Utility item (300 tokens) must NOT be included
         Assert.DoesNotContain(selected, t => t.Content == "Huge Low Utility");
     }
+
+    [Fact]
+    public void KnapsackPromptPacker_PicksOptimalSubsetOverGreedyDensityDecoy()
+    {
+        // Classic greedy counterexample: capacity=10
+        // Item A: w=1, u=2 (density=2.0) -> decoy
+        // Item B: w=10, u=19 (density=1.9) -> optimal
+        var decoy = new EpisodicTrace { Content = "Decoy", TokenCount = 1 };
+        var optimal = new EpisodicTrace { Content = "Optimal", TokenCount = 10 };
+
+        var selected = KnapsackPromptPacker.PackTraces([(decoy, 2.0), (optimal, 19.0)], maxTokens: 10);
+        Assert.Single(selected);
+        Assert.Equal("Optimal", selected[0].Content);
+    }
 }

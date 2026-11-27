@@ -42,4 +42,23 @@ public class HippoRagActivationTests
         Assert.Equal(0.0, ppr["Physics"]);
         Assert.Equal(0.0, ppr["Thermodynamics"]);
     }
+
+    [Fact]
+    public void ScoreTrace_DeduplicatesRepeatedEntities()
+    {
+        var ppr = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Alpha"] = 0.5,
+            ["Beta"] = 0.25
+        };
+
+        var duplicated = new EpisodicTrace
+        {
+            Content = "Repeated",
+            Entities = ["Alpha", "alpha", "ALPHA", "Beta"]
+        };
+
+        double score = HippoRagSpreadingActivation.ScoreTrace(duplicated, ppr);
+        Assert.Equal(0.75, score, precision: 6);
+    }
 }

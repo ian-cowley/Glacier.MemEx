@@ -276,9 +276,10 @@ public sealed class MemExEngine : IDisposable
                 _options.DecayParameterD,
                 _options.TimeScaleTauSeconds);
 
-            // B) Vector similarity score
-            vectorMatches.TryGetValue(trace.Id, out float vecSim);
-            double normVec = (vecSim + 1.0) * 0.5; // Map [-1, 1] to [0, 1]
+            // B) Vector similarity score (0.0 for unembedded or filtered-out traces)
+            double normVec = vectorMatches.TryGetValue(trace.Id, out float vecSim)
+                ? (vecSim + 1.0) * 0.5 // Map [-1, 1] to [0, 1]
+                : 0.0;
 
             // C) HippoRAG graph score
             double graphScore = HippoRagSpreadingActivation.ScoreTrace(trace, pprScores);
@@ -798,10 +799,16 @@ public sealed class MemExEngine : IDisposable
 
         try { _disposeCts.Cancel(); } catch (ObjectDisposedException) { }
 
-        if (_initGate.Wait(0))
+        try
         {
-            _initGate.Release();
-            _initGate.Dispose();
+            if (_initGate.Wait(0))
+            {
+                _initGate.Release();
+                _initGate.Dispose();
+            }
+        }
+        catch (ObjectDisposedException)
+        {
         }
 
         if (_ownsResolvedModel)

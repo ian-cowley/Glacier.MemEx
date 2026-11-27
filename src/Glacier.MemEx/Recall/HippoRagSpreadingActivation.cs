@@ -105,9 +105,20 @@ public static class HippoRagSpreadingActivation
         if (trace?.Entities == null || trace.Entities.Count == 0 || pprScores == null || pprScores.Count == 0) return 0.0;
 
         double sum = 0.0;
+        if (trace.Entities.Count == 1)
+        {
+            string only = trace.Entities[0];
+            if (!string.IsNullOrWhiteSpace(only) && pprScores.TryGetValue(only, out double s))
+            {
+                return s;
+            }
+            return 0.0;
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var entity in trace.Entities)
         {
-            if (!string.IsNullOrWhiteSpace(entity) && pprScores.TryGetValue(entity, out double s))
+            if (!string.IsNullOrWhiteSpace(entity) && seen.Add(entity) && pprScores.TryGetValue(entity, out double s))
             {
                 sum += s;
             }
