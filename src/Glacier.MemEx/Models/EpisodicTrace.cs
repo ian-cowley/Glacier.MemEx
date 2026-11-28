@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading;
+using Glacier.Bundle.Budgeting;
 using Glacier.Rag.Embeddings;
 
 public sealed class EpisodicTrace
@@ -13,6 +14,8 @@ public sealed class EpisodicTrace
     private float[]? _embedding;
     private ulong[]? _binaryEmbedding;
     private int _tokenCount;
+    private int _hasExplicitTokenCount;
+    private int _formattedOverheadTokens;
 
     public string Id { get; init; } = Guid.NewGuid().ToString("N");
     public string Content { get; init; } = "";
@@ -53,10 +56,25 @@ public sealed class EpisodicTrace
     public int TokenCount
     {
         get => Volatile.Read(ref _tokenCount);
-        init => Volatile.Write(ref _tokenCount, value);
+        init
+        {
+            Volatile.Write(ref _tokenCount, value);
+            if (value > 0)
+            {
+                Volatile.Write(ref _hasExplicitTokenCount, 1);
+            }
+        }
     }
     public float BaseImportance { get; init; } = 1.0f;
     public Dictionary<string, string> Metadata { get; init; } = [];
+
+    internal bool HasExplicitTokenCount => Volatile.Read(ref _hasExplicitTokenCount) != 0;
+
+    internal int FormattedOverheadTokens
+    {
+        get => Volatile.Read(ref _formattedOverheadTokens);
+        set => Volatile.Write(ref _formattedOverheadTokens, value);
+    }
 
     internal void SetTokenCount(int value) => Volatile.Write(ref _tokenCount, value);
 
@@ -115,6 +133,8 @@ public sealed class MemExOptions
     public float WeightImportance { get; init; } = 0.10f;
     public int CoarseCandidateLimit { get; init; } = 64;
     public int MaxPromptTokens { get; init; } = 2048;
+    public ITokenEstimator? TokenEstimator { get; init; }
+    public bool FoldDeepSubtrees { get; init; } = false;
 
     public bool EnableNpuEmbeddings { get; init; } = true;
     public bool AutoEmbedMissingVectors { get; init; } = true;

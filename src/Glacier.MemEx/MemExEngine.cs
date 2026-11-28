@@ -1,6 +1,7 @@
 namespace Glacier.MemEx;
 
 using System;
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -8,6 +9,7 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Glacier.Bundle.Budgeting;
 using Glacier.Inference.Hardware;
 using Glacier.MemEx.Budgeting;
 using Glacier.MemEx.Decay;
@@ -18,16 +20,21 @@ using Glacier.Rag.Embeddings;
 public sealed class MemExEngine : IDisposable
 {
     private const string DefaultEmbeddingModelId = "embeddinggemma";
+    private const int QueryStackAllocLimit = 256;
 
     private readonly ConcurrentDictionary<string, EpisodicTrace> _traces = new(StringComparer.Ordinal);
     private readonly MemExOptions _options;
+    private readonly ITokenEstimator _tokenEstimator;
     private readonly SemaphoreSlim _initGate = new(1, 1);
     private readonly CancellationTokenSource _disposeCts = new();
     private readonly object _fallbackLock = new();
+    private readonly object _graphBuildLock = new();
     private readonly List<IDisposable> _retiredModels = [];
 
     private IEmbeddingModel? _resolvedModel;
     private FastHashEmbeddingModel? _fallbackHashModel;
+    private EntityCsrGraph? _cachedEntityGraph;
+    private long _topologyVersion;
     private int _resolvedDimensions;
     private bool _ownsResolvedModel;
     private string? _activeEndpoint;
@@ -37,6 +44,7 @@ public sealed class MemExEngine : IDisposable
     public MemExEngine(MemExOptions? options = null)
     {
         _options = options ?? new MemExOptions();
+        _tokenEstimator = _options.TokenEstimator ?? new HeuristicTokenEstimator();
 
         if (_options.FallbackHashDimensions <= 0 || _options.FallbackHashDimensions % 8 != 0)
         {
@@ -129,7 +137,7 @@ public sealed class MemExEngine : IDisposable
         }
 
         QuantizeTraceIfNeeded(trace);
-        _traces[trace.Id] = trace;
+        StoreTraceWithTopologyUpdate(trace);
     }
 
     public async Task StoreTraceAsync(EpisodicTrace trace, CancellationToken cancellationToken = default)
@@ -150,7 +158,7 @@ public sealed class MemExEngine : IDisposable
         }
 
         QuantizeTraceIfNeeded(trace);
-        _traces[trace.Id] = trace;
+        StoreTraceWithTopologyUpdate(trace);
     }
 
     public MemoryQueryResult Query(
@@ -242,106 +250,287 @@ public sealed class MemExEngine : IDisposable
     {
         long nowUs = currentTimestampUs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
         int budget = maxTokens ?? _options.MaxPromptTokens;
+        int n = traceList.Count;
 
-        // 1. Two-tier Vector Recall (1-bit coarse filter + FP32 cosine re-ranking)
-        var vectorMatches = new Dictionary<string, float>(StringComparer.Ordinal);
-        if (queryEmbedding.Length > 0)
+        float[]? rentedCosines = n > QueryStackAllocLimit ? ArrayPool<float>.Shared.Rent(n) : null;
+        double[]? rentedPprTrace = n > QueryStackAllocLimit ? ArrayPool<double>.Shared.Rent(n) : null;
+        double[]? rentedUtilities = n > QueryStackAllocLimit ? ArrayPool<double>.Shared.Rent(n) : null;
+        int[]? rentedCosts = n > QueryStackAllocLimit ? ArrayPool<int>.Shared.Rent(n) : null;
+        int[]? rentedSelected = n > QueryStackAllocLimit ? ArrayPool<int>.Shared.Rent(n) : null;
+
+        Span<float> vecCosines = n <= QueryStackAllocLimit ? stackalloc float[n] : rentedCosines.AsSpan(0, n);
+        Span<double> pprTraceScores = n <= QueryStackAllocLimit ? stackalloc double[n] : rentedPprTrace.AsSpan(0, n);
+        Span<double> utilities = n <= QueryStackAllocLimit ? stackalloc double[n] : rentedUtilities.AsSpan(0, n);
+        Span<int> tokenCosts = n <= QueryStackAllocLimit ? stackalloc int[n] : rentedCosts.AsSpan(0, n);
+        Span<int> selectedIndices = n <= QueryStackAllocLimit ? stackalloc int[n] : rentedSelected.AsSpan(0, n);
+
+        try
         {
-            var reranked = TwoTierVectorFilter.FilterAndRerank(
-                queryEmbedding,
+            // 1. Two-tier Vector Recall (FWHT 1-bit coarse filter + FP32 cosine re-ranking, non-zeroing outside coarseLimit)
+            if (queryEmbedding.Length > 0)
+            {
+                TwoTierVectorFilter.ScoreAllTraces(
+                    queryEmbedding,
+                    traceList,
+                    _options.CoarseCandidateLimit,
+                    vecCosines);
+            }
+            else
+            {
+                vecCosines.Fill(float.NaN);
+            }
+
+            // 2. Cached CSR HippoRAG Spreading Activation (zero per-query Dictionary/HashSet rebuild)
+            pprTraceScores.Clear();
+            if (queryEntities != null && queryEntities.Count > 0)
+            {
+                EntityCsrGraph graph = GetOrBuildEntityGraph();
+                if (graph.NodeCount > 0)
+                {
+                    int pprBufLen = graph.NodeCount + 1;
+                    float[]? rentedPpr = pprBufLen > QueryStackAllocLimit ? ArrayPool<float>.Shared.Rent(pprBufLen) : null;
+                    int[]? rentedStamp = pprBufLen > QueryStackAllocLimit ? ArrayPool<int>.Shared.Rent(pprBufLen) : null;
+
+                    Span<float> pprScores = pprBufLen <= QueryStackAllocLimit
+                        ? stackalloc float[pprBufLen]
+                        : rentedPpr.AsSpan(0, pprBufLen);
+                    Span<int> seenStamp = pprBufLen <= QueryStackAllocLimit
+                        ? stackalloc int[pprBufLen]
+                        : rentedStamp.AsSpan(0, pprBufLen);
+
+                    try
+                    {
+                        if (HippoRagSpreadingActivation.ComputePersonalizedPageRank(graph, queryEntities, pprScores))
+                        {
+                            seenStamp.Clear();
+                            for (int i = 0; i < n; i++)
+                            {
+                                List<string>? ents = traceList[i].Entities;
+                                if (ents == null || ents.Count == 0) continue;
+
+                                if (ents.Count == 1)
+                                {
+                                    string only = ents[0];
+                                    if (!string.IsNullOrWhiteSpace(only) && graph.EntityToNodeId.TryGetValue(only, out int nodeId))
+                                    {
+                                        pprTraceScores[i] = pprScores[nodeId];
+                                    }
+                                    continue;
+                                }
+
+                                int stamp = i + 1;
+                                double sum = 0.0;
+                                for (int e = 0; e < ents.Count; e++)
+                                {
+                                    string entity = ents[e];
+                                    if (!string.IsNullOrWhiteSpace(entity) &&
+                                        graph.EntityToNodeId.TryGetValue(entity, out int nodeId) &&
+                                        seenStamp[nodeId] != stamp)
+                                    {
+                                        seenStamp[nodeId] = stamp;
+                                        sum += pprScores[nodeId];
+                                    }
+                                }
+                                pprTraceScores[i] = sum;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (rentedStamp != null) ArrayPool<int>.Shared.Return(rentedStamp);
+                        if (rentedPpr != null) ArrayPool<float>.Shared.Return(rentedPpr);
+                    }
+                }
+            }
+
+            // 3. Score all candidates using composite activation and compute formatting-aware knapsack costs
+            bool allExplicit = true;
+            for (int i = 0; i < n; i++)
+            {
+                EpisodicTrace trace = traceList[i];
+
+                // A) Power-law temporal decay recency score
+                double recency = PowerLawDecayCalculator.ComputeRecencyScore(
+                    trace,
+                    nowUs,
+                    _options.DecayParameterD,
+                    _options.TimeScaleTauSeconds);
+
+                // B) Vector similarity score (0.0 for unembedded/mismatched traces; Hamming estimate for non-top-coarse valid traces)
+                float vecSim = vecCosines[i];
+                double normVec = float.IsNaN(vecSim) ? 0.0 : (vecSim + 1.0) * 0.5;
+
+                // C) HippoRAG graph score
+                double graphScore = pprTraceScores[i];
+
+                // D) Base importance
+                double importance = Math.Clamp(trace.BaseImportance, 0.1f, 5.0f);
+
+                // Composite Activation: A_i(t)
+                double activation =
+                    (_options.WeightDecay * recency) +
+                    (_options.WeightVector * normVec) +
+                    (_options.WeightGraph * graphScore) +
+                    (_options.WeightImportance * (importance / 5.0));
+
+                // Utility u_i = exp(A_i(t))
+                utilities[i] = Math.Exp(activation);
+
+                if (trace.HasExplicitTokenCount)
+                {
+                    tokenCosts[i] = Math.Max(1, trace.TokenCount);
+                }
+                else
+                {
+                    allExplicit = false;
+                    int overhead = trace.FormattedOverheadTokens > 0
+                        ? trace.FormattedOverheadTokens
+                        : BreadcrumbTreeFolder.EstimateTraceOverheadTokens(trace, _tokenEstimator);
+                    tokenCosts[i] = Math.Max(1, trace.TokenCount + overhead);
+                }
+            }
+
+            // 4. 0/1 Knapsack Prompt Budget Optimization (selects budget-optimal subset, then sorts in-place by Utility descending)
+            int headerTokens = allExplicit ? 0 : BreadcrumbTreeFolder.EstimateHeaderTokens(_tokenEstimator);
+            int packingBudget = allExplicit ? budget : Math.Max(0, budget - headerTokens);
+
+            KnapsackPromptPacker.PackTraceIndices(
                 traceList,
-                coarseLimit: _options.CoarseCandidateLimit,
-                finalLimit: traceList.Count);
+                utilities,
+                tokenCosts,
+                packingBudget,
+                selectedIndices,
+                out int selectedCount,
+                out _);
 
-            foreach (var (t, cos) in reranked)
+            if (selectedCount > 1)
             {
-                vectorMatches[t.Id] = cos;
-            }
-        }
-
-        // 2. HippoRAG Spreading Activation
-        var pprScores = (queryEntities != null && queryEntities.Count > 0)
-            ? HippoRagSpreadingActivation.ComputePersonalizedPageRank(queryEntities, traceList)
-            : [];
-
-        // 3. Score all candidates using composite activation
-        var scoredCandidates = new List<(EpisodicTrace Trace, double Utility)>(traceList.Count);
-
-        foreach (var trace in traceList)
-        {
-            // A) Power-law temporal decay recency score
-            double recency = PowerLawDecayCalculator.ComputeRecencyScore(
-                trace,
-                nowUs,
-                _options.DecayParameterD,
-                _options.TimeScaleTauSeconds);
-
-            // B) Vector similarity score (0.0 for unembedded or filtered-out traces)
-            double normVec = vectorMatches.TryGetValue(trace.Id, out float vecSim)
-                ? (vecSim + 1.0) * 0.5 // Map [-1, 1] to [0, 1]
-                : 0.0;
-
-            // C) HippoRAG graph score
-            double graphScore = HippoRagSpreadingActivation.ScoreTrace(trace, pprScores);
-
-            // D) Base importance
-            double importance = Math.Clamp(trace.BaseImportance, 0.1f, 5.0f);
-
-            // Composite Activation: A_i(t)
-            double activation =
-                (_options.WeightDecay * recency) +
-                (_options.WeightVector * normVec) +
-                (_options.WeightGraph * graphScore) +
-                (_options.WeightImportance * (importance / 5.0));
-
-            // Utility u_i = exp(A_i(t))
-            double utility = Math.Exp(activation);
-            scoredCandidates.Add((trace, utility));
-        }
-
-        // 4. 0/1 Knapsack Prompt Budget Optimization (selects budget-optimal subset, then orders by Utility descending)
-        var selectedTraces = KnapsackPromptPacker.PackTraces(scoredCandidates, budget);
-        if (selectedTraces.Count > 1)
-        {
-            var utilityById = new Dictionary<string, double>(scoredCandidates.Count, StringComparer.Ordinal);
-            foreach (var (trace, utility) in scoredCandidates)
-            {
-                utilityById[trace.Id] = utility;
+                SortIndicesByUtilityDescending(selectedIndices.Slice(0, selectedCount), utilities);
             }
 
-            selectedTraces = selectedTraces
-                .OrderByDescending(t => utilityById.GetValueOrDefault(t.Id))
-                .ToList();
+            var selectedTraces = new List<EpisodicTrace>(selectedCount);
+            int totalTokens = 0;
+            double totalUtility = 0.0;
+            for (int k = 0; k < selectedCount; k++)
+            {
+                int idx = selectedIndices[k];
+                EpisodicTrace t = traceList[idx];
+                selectedTraces.Add(t);
+                t.RecordAccess(nowUs);
+                totalTokens += t.TokenCount;
+                totalUtility += utilities[idx];
+            }
+
+            string formattedContext = BreadcrumbTreeFolder.FormatTraceContext(
+                selectedTraces,
+                budget,
+                _tokenEstimator,
+                _options.FoldDeepSubtrees);
+
+            return new MemoryQueryResult
+            {
+                SelectedTraces = selectedTraces,
+                TotalTokens = totalTokens,
+                TotalUtility = totalUtility,
+                FormattedContext = formattedContext
+            };
         }
-
-        // Record retrieval access events
-        foreach (var t in selectedTraces)
+        finally
         {
-            t.RecordAccess(nowUs);
+            if (rentedSelected != null) ArrayPool<int>.Shared.Return(rentedSelected);
+            if (rentedCosts != null) ArrayPool<int>.Shared.Return(rentedCosts);
+            if (rentedUtilities != null) ArrayPool<double>.Shared.Return(rentedUtilities);
+            if (rentedPprTrace != null) ArrayPool<double>.Shared.Return(rentedPprTrace);
+            if (rentedCosines != null) ArrayPool<float>.Shared.Return(rentedCosines);
         }
-
-        int totalTokens = selectedTraces.Sum(t => t.TokenCount);
-        double totalUtility = scoredCandidates
-            .Where(c => selectedTraces.Contains(c.Trace))
-            .Sum(c => c.Utility);
-
-        string formattedContext = BreadcrumbTreeFolder.FormatTraceContext(selectedTraces);
-
-        return new MemoryQueryResult
-        {
-            SelectedTraces = selectedTraces,
-            TotalTokens = totalTokens,
-            TotalUtility = totalUtility,
-            FormattedContext = formattedContext
-        };
     }
 
-    private static void EnsureTokenCount(EpisodicTrace trace)
+    private void EnsureTokenCount(EpisodicTrace trace)
     {
         if (trace.TokenCount <= 0 && !string.IsNullOrWhiteSpace(trace.Content))
         {
-            // Estimate tokens: ~4 chars per token (zero reflection for NativeAOT)
-            trace.SetTokenCount(Math.Max(1, trace.Content.Length / 4));
+            trace.SetTokenCount(Math.Max(1, _tokenEstimator.EstimateTokens(trace.Content.Trim())));
+        }
+
+        trace.FormattedOverheadTokens = BreadcrumbTreeFolder.EstimateTraceOverheadTokens(trace, _tokenEstimator);
+    }
+
+    private void StoreTraceWithTopologyUpdate(EpisodicTrace trace)
+    {
+        bool topologyChanged = HasEntities(trace);
+        _traces.AddOrUpdate(
+            trace.Id,
+            trace,
+            (_, existing) =>
+            {
+                if (HasEntities(existing))
+                {
+                    topologyChanged = true;
+                }
+                return trace;
+            });
+
+        if (topologyChanged)
+        {
+            Interlocked.Increment(ref _topologyVersion);
+        }
+    }
+
+    private static bool HasEntities(EpisodicTrace? trace) =>
+        trace?.Entities is { Count: > 0 };
+
+    private EntityCsrGraph GetOrBuildEntityGraph()
+    {
+        long currentVersion = Volatile.Read(ref _topologyVersion);
+        EntityCsrGraph? cached = Volatile.Read(ref _cachedEntityGraph);
+        if (cached != null && cached.Version == currentVersion)
+        {
+            return cached;
+        }
+
+        lock (_graphBuildLock)
+        {
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                long vBefore = Volatile.Read(ref _topologyVersion);
+                cached = _cachedEntityGraph;
+                if (cached != null && cached.Version == vBefore)
+                {
+                    return cached;
+                }
+
+                List<EpisodicTrace> snapshot = _traces.Values.ToList();
+                EntityCsrGraph built = EntityCsrGraph.Build(snapshot, vBefore);
+                long vAfter = Volatile.Read(ref _topologyVersion);
+                if (vAfter == vBefore)
+                {
+                    Volatile.Write(ref _cachedEntityGraph, built);
+                    return built;
+                }
+
+                if (attempt == 1)
+                {
+                    return built;
+                }
+            }
+        }
+
+        return EntityCsrGraph.Empty;
+    }
+
+    private static void SortIndicesByUtilityDescending(Span<int> indices, ReadOnlySpan<double> utilities)
+    {
+        for (int i = 1; i < indices.Length; i++)
+        {
+            int keyIdx = indices[i];
+            double keyUtil = utilities[keyIdx];
+            int j = i - 1;
+            while (j >= 0 && utilities[indices[j]] < keyUtil)
+            {
+                indices[j + 1] = indices[j];
+                j--;
+            }
+            indices[j + 1] = keyIdx;
         }
     }
 
@@ -844,29 +1033,44 @@ public sealed class MemExEngine : IDisposable
         if (minAccessCount < 0) throw new ArgumentOutOfRangeException(nameof(minAccessCount));
 
         long nowUs = currentTimestampUs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
-        var candidates = new List<(EpisodicTrace Trace, double Score)>();
+        (EpisodicTrace Item, double Score)[] heapBuf = ArrayPool<(EpisodicTrace Item, double Score)>.Shared.Rent(maxCount);
 
-        foreach (var trace in _traces.Values)
+        try
         {
-            if (string.IsNullOrWhiteSpace(trace.Content) || trace.AccessCount < minAccessCount)
-                continue;
+            var topHeap = new BoundedMinItemHeap<EpisodicTrace>(heapBuf, maxCount);
 
-            double recency = PowerLawDecayCalculator.ComputeRecencyScore(
-                trace,
-                nowUs,
-                _options.DecayParameterD,
-                _options.TimeScaleTauSeconds);
+            foreach (var trace in _traces.Values)
+            {
+                if (string.IsNullOrWhiteSpace(trace.Content) || trace.AccessCount < minAccessCount)
+                    continue;
 
-            double importance = Math.Clamp(trace.BaseImportance, 0.1f, 5.0f) / 5.0;
-            double score = (_options.WeightDecay * recency) + (_options.WeightImportance * importance);
-            candidates.Add((trace, score));
+                double recency = PowerLawDecayCalculator.ComputeRecencyScore(
+                    trace,
+                    nowUs,
+                    _options.DecayParameterD,
+                    _options.TimeScaleTauSeconds);
+
+                double importance = Math.Clamp(trace.BaseImportance, 0.1f, 5.0f) / 5.0;
+                double score = (_options.WeightDecay * recency) + (_options.WeightImportance * importance);
+                topHeap.Offer(trace, score);
+            }
+
+            int resultCount = topHeap.Count;
+            if (resultCount == 0)
+                return [];
+
+            var result = new EpisodicTrace[resultCount];
+            for (int i = resultCount - 1; i >= 0; i--)
+            {
+                topHeap.TryDequeue(out EpisodicTrace item, out _);
+                result[i] = item;
+            }
+            return result;
         }
-
-        return candidates
-            .OrderByDescending(c => c.Score)
-            .Take(maxCount)
-            .Select(c => c.Trace)
-            .ToArray();
+        finally
+        {
+            ArrayPool<(EpisodicTrace Item, double Score)>.Shared.Return(heapBuf, clearArray: true);
+        }
     }
 
     /// <summary>
@@ -876,13 +1080,24 @@ public sealed class MemExEngine : IDisposable
     {
         ArgumentNullException.ThrowIfNull(traceIds);
         int removed = 0;
+        bool topologyChanged = false;
         foreach (string id in traceIds)
         {
-            if (!string.IsNullOrEmpty(id) && _traces.TryRemove(id, out _))
+            if (!string.IsNullOrEmpty(id) && _traces.TryRemove(id, out EpisodicTrace? removedTrace))
             {
                 removed++;
+                if (HasEntities(removedTrace))
+                {
+                    topologyChanged = true;
+                }
             }
         }
+
+        if (topologyChanged)
+        {
+            Interlocked.Increment(ref _topologyVersion);
+        }
+
         return removed;
     }
 
@@ -893,6 +1108,7 @@ public sealed class MemExEngine : IDisposable
     {
         long nowUs = currentTimestampUs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L;
         int removed = 0;
+        bool topologyChanged = false;
 
         foreach (var kvp in _traces)
         {
@@ -902,10 +1118,19 @@ public sealed class MemExEngine : IDisposable
                 _options.DecayParameterD,
                 _options.TimeScaleTauSeconds);
 
-            if (recency < minRecencyScore && _traces.TryRemove(kvp.Key, out _))
+            if (recency < minRecencyScore && _traces.TryRemove(kvp.Key, out EpisodicTrace? removedTrace))
             {
                 removed++;
+                if (HasEntities(removedTrace))
+                {
+                    topologyChanged = true;
+                }
             }
+        }
+
+        if (topologyChanged)
+        {
+            Interlocked.Increment(ref _topologyVersion);
         }
 
         return removed;

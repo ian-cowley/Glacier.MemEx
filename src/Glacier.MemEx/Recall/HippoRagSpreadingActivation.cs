@@ -1,12 +1,15 @@
 namespace Glacier.MemEx.Recall;
 
 using System;
+using System.Buffers;
 using System.Collections.Generic;
-using System.Linq;
+using Glacier.Graph.Kernels;
 using Glacier.MemEx.Models;
 
 public static class HippoRagSpreadingActivation
 {
+    private const float ConvergenceTolerance = 1e-7f;
+
     /// <summary>
     /// Executes Personalized PageRank (PPR) spreading activation from query entity seeds
     /// across an associative co-occurrence graph of entities and traces.
@@ -17,84 +20,149 @@ public static class HippoRagSpreadingActivation
         double dampingAlpha = 0.85,
         int maxIterations = 20)
     {
-        if (queryEntities == null || queryEntities.Count == 0 || allTraces == null || allTraces.Count == 0) return [];
+        if (queryEntities == null || queryEntities.Count == 0 || allTraces == null || allTraces.Count == 0)
+            return [];
 
-        // 1. Build entity co-occurrence adjacency list
-        var graph = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var trace in allTraces)
+        EntityCsrGraph graph = EntityCsrGraph.Build(allTraces);
+        if (graph.NodeCount == 0)
+            return [];
+
+        int bufLen = graph.NodeCount + 1;
+        float[]? rentedScores = bufLen > 1024 ? ArrayPool<float>.Shared.Rent(bufLen) : null;
+        Span<float> pprScores = bufLen <= 1024
+            ? stackalloc float[bufLen]
+            : rentedScores.AsSpan(0, bufLen);
+
+        try
         {
-            var ents = trace?.Entities;
-            if (ents == null || ents.Count == 0) continue;
+            ComputePersonalizedPageRank(
+                graph,
+                queryEntities,
+                pprScores,
+                dampingAlpha,
+                maxIterations,
+                fallbackToUniformIfNoSeeds: true);
 
-            for (int i = 0; i < ents.Count; i++)
+            var result = new Dictionary<string, double>(graph.NodeCount, StringComparer.OrdinalIgnoreCase);
+            for (int u = 1; u <= graph.NodeCount; u++)
             {
-                if (string.IsNullOrWhiteSpace(ents[i])) continue;
-                if (!graph.TryGetValue(ents[i], out var neighbors))
-                {
-                    neighbors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                    graph[ents[i]] = neighbors;
-                }
-
-                for (int j = 0; j < ents.Count; j++)
-                {
-                    if (i != j && !string.IsNullOrWhiteSpace(ents[j])) neighbors.Add(ents[j]);
-                }
+                result[graph.NodeNames[u]] = pprScores[u];
             }
+            return result;
+        }
+        finally
+        {
+            if (rentedScores != null) ArrayPool<float>.Shared.Return(rentedScores);
+        }
+    }
+
+    /// <summary>
+    /// Executes contiguous-span <see cref="CsrKernels.PersonalizedPageRank"/> over a prebuilt <see cref="EntityCsrGraph"/>.
+    /// Returns <see langword="true"/> if at least one query entity matched the graph (or uniform fallback ran);
+    /// otherwise clears <paramref name="pprScoresOut"/> to zeros and returns <see langword="false"/>.
+    /// </summary>
+    internal static bool ComputePersonalizedPageRank(
+        EntityCsrGraph graph,
+        IReadOnlyList<string> queryEntities,
+        Span<float> pprScoresOut,
+        double dampingAlpha = 0.85,
+        int maxIterations = 20,
+        bool fallbackToUniformIfNoSeeds = false)
+    {
+        if (graph.NodeCount <= 0)
+        {
+            pprScoresOut.Clear();
+            return false;
         }
 
-        if (graph.Count == 0) return [];
-
-        var allNodes = graph.Keys.ToList();
-        int n = allNodes.Count;
-
-        // 2. Initialize teleport distribution vector p0
-        var p0 = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        var activeSeeds = queryEntities.Where(e => !string.IsNullOrWhiteSpace(e) && graph.ContainsKey(e)).ToList();
-
-        if (activeSeeds.Count == 0)
+        if (pprScoresOut.Length < graph.NodeCount + 1)
         {
-            double uniform = 1.0 / n;
-            foreach (var node in allNodes) p0[node] = uniform;
-        }
-        else
-        {
-            double seedWeight = 1.0 / activeSeeds.Count;
-            foreach (var s in activeSeeds) p0[s] = seedWeight;
-            foreach (var node in allNodes) if (!p0.ContainsKey(node)) p0[node] = 0.0;
+            throw new ArgumentException($"pprScoresOut length ({pprScoresOut.Length}) must be >= {graph.NodeCount + 1}.", nameof(pprScoresOut));
         }
 
-        // 3. Power iteration: p = (1 - alpha) * p0 + alpha * (M * p)
-        var p = new Dictionary<string, double>(p0, StringComparer.OrdinalIgnoreCase);
-        var pNext = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-
-        for (int iter = 0; iter < maxIterations; iter++)
+        if (queryEntities == null || queryEntities.Count == 0)
         {
-            foreach (var node in allNodes)
+            pprScoresOut.Slice(0, graph.NodeCount + 1).Clear();
+            return false;
+        }
+
+        int maxSeeds = queryEntities.Count;
+        int[]? rentedSeeds = maxSeeds > 64 ? ArrayPool<int>.Shared.Rent(maxSeeds) : null;
+        Span<int> seedIds = maxSeeds <= 64
+            ? stackalloc int[maxSeeds]
+            : rentedSeeds.AsSpan(0, maxSeeds);
+
+        int seedCount = 0;
+        HashSet<int>? largeSeedSet = null;
+
+        try
+        {
+            for (int i = 0; i < queryEntities.Count; i++)
             {
-                pNext[node] = (1.0 - dampingAlpha) * p0[node];
-            }
+                string entity = queryEntities[i];
+                if (string.IsNullOrWhiteSpace(entity)) continue;
 
-            foreach (var u in allNodes)
-            {
-                var neighbors = graph[u];
-                if (neighbors.Count == 0)
+                if (!graph.EntityToNodeId.TryGetValue(entity, out int nodeId))
+                    continue;
+
+                // Deduplicate matched seeds so personalization weights stay strictly uniform across unique query entities
+                bool isDuplicate = false;
+                if (seedCount <= 32)
                 {
-                    // Dangling node distributes to teleport
-                    double contrib = dampingAlpha * p[u] / n;
-                    foreach (var v in allNodes) pNext[v] += contrib;
+                    for (int k = 0; k < seedCount; k++)
+                    {
+                        if (seedIds[k] == nodeId)
+                        {
+                            isDuplicate = true;
+                            break;
+                        }
+                    }
                 }
                 else
                 {
-                    double outWeight = dampingAlpha * p[u] / neighbors.Count;
-                    foreach (var v in neighbors) pNext[v] += outWeight;
+                    if (largeSeedSet == null)
+                    {
+                        largeSeedSet = new HashSet<int>(seedCount);
+                        for (int k = 0; k < seedCount; k++) largeSeedSet.Add(seedIds[k]);
+                    }
+                    isDuplicate = !largeSeedSet.Add(nodeId);
+                }
+
+                if (!isDuplicate)
+                {
+                    seedIds[seedCount++] = nodeId;
                 }
             }
 
-            // Swap buffers
-            foreach (var node in allNodes) p[node] = pNext[node];
-        }
+            if (seedCount == 0 && !fallbackToUniformIfNoSeeds)
+            {
+                pprScoresOut.Slice(0, graph.NodeCount + 1).Clear();
+                return false;
+            }
 
-        return p;
+            float alpha = double.IsFinite(dampingAlpha)
+                ? (float)Math.Clamp(dampingAlpha, 0.0, 1.0)
+                : 0.85f;
+            int iterations = Math.Max(0, maxIterations);
+
+            CsrKernels.PersonalizedPageRank(
+                graph.RowOffsets,
+                graph.ColumnIndices,
+                ReadOnlySpan<float>.Empty,
+                graph.NodeCount,
+                seedIds.Slice(0, seedCount),
+                ReadOnlySpan<float>.Empty,
+                pprScoresOut,
+                alpha,
+                iterations,
+                ConvergenceTolerance);
+
+            return true;
+        }
+        finally
+        {
+            if (rentedSeeds != null) ArrayPool<int>.Shared.Return(rentedSeeds);
+        }
     }
 
     /// <summary>

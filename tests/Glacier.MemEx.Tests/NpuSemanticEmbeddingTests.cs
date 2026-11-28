@@ -1049,7 +1049,7 @@ public sealed class NpuSemanticEmbeddingTests : IDisposable
             {
                 _acceptTask.Wait(TimeSpan.FromSeconds(2));
             }
-            catch
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or AggregateException or SocketException)
             {
             }
             _cts.Dispose();
